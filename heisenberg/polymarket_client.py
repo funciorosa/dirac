@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://clob.polymarket.com"
+GAMMA_URL = "https://gamma-api.polymarket.com"
 DEFAULT_TIMEOUT = 10.0          # seconds per request
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.0              # seconds; doubles each retry
@@ -284,14 +285,14 @@ class PolymarketCLOBClient:
         Parameters
         ----------
         token_id:
-            The hex token ID (outcome token address) for the market side.
+            The decimal token ID as returned by the Gamma API clobTokenIds field.
 
         Returns
         -------
         OrderBook
             Snapshot containing bids and asks sorted as returned by the API.
         """
-        data = await self._get(f"/order-book/{token_id}")
+        data = await self._get("/book", params={"token_id": token_id})
         bids = _parse_price_levels(data.get("bids", []))
         asks = _parse_price_levels(data.get("asks", []))
         return OrderBook(token_id=token_id, bids=bids, asks=asks)
@@ -344,7 +345,7 @@ class PolymarketCLOBClient:
     async def search_markets(
         self,
         query: str,
-        limit: int = 50,
+        limit: int = 100,
         active_only: bool = True,
     ) -> list[MarketInfo]:
         """Search markets by keyword.
@@ -362,7 +363,7 @@ class PolymarketCLOBClient:
         -------
         list of MarketInfo objects.
         """
-        params: dict[str, Any] = {"search": query, "limit": limit}
+        params: dict[str, Any] = {"search": query, "limit": limit, "active": "true"}
         data = await self._get("/markets", params=params)
 
         raw_items: list[dict[str, Any]] = []
@@ -376,36 +377,297 @@ class PolymarketCLOBClient:
             markets = [m for m in markets if m.active]
         return markets
 
-    async def fetch_btc_markets(self) -> list[MarketInfo]:
-        """Fetch active BTC-related prediction markets.
+    async def _gamma_get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """GET against the Gamma API (market discovery) using a one-shot client."""
+        url = GAMMA_URL.rstrip("/") + path
+        async with httpx.AsyncClient(timeout=self.timeout, headers={"Accept": "application/json"}) as c:
+            response = await c.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
 
-        Searches for markets containing "BTC" in their title/question and
-        returns only active ones.
+    async def fetch_btc_markets(self) -> list[MarketInfo]:
+        """Fetch active BTC/Bitcoin prediction markets via the Gamma API.
+
+        Uses gamma-api.polymarket.com/events with tag_slug=crypto, then
+        filters for Bitcoin-related markets.  Falls back to CLOB search
+        if the Gamma API is unavailable.
 
         Returns
         -------
         list of MarketInfo representing live BTC markets.
         """
-        return await self.search_markets("BTC", active_only=True)
+        btc_kws = ("btc", "bitcoin")
+        results: list[MarketInfo] = []
+        seen: set[str] = set()
+
+        try:
+            # Pull crypto events — each event contains multiple correlated markets
+            data = await self._gamma_get(
+                "/events",
+                params={"closed": "false", "limit": 100, "tag_slug": "crypto"},
+            )
+            events = data if isinstance(data, list) else data.get("data", [])
+            for event in events:
+                for mkt in event.get("markets", []):
+                    question = mkt.get("question") or mkt.get("title") or ""
+                    if not any(kw in question.lower() for kw in btc_kws):
+                        continue
+                    # Only include markets that currently accept orders on the CLOB
+                    if not mkt.get("acceptingOrders", False):
+                        continue
+                    cid = mkt.get("conditionId") or mkt.get("condition_id") or ""
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    # clobTokenIds is the live token list from Gamma API
+                    raw_token_ids = mkt.get("clobTokenIds") or mkt.get("tokens") or []
+                    if isinstance(raw_token_ids, str):
+                        import json as _json
+                        try:
+                            raw_token_ids = _json.loads(raw_token_ids)
+                        except Exception:
+                            raw_token_ids = []
+                    tokens = [{"token_id": tid} for tid in raw_token_ids if isinstance(tid, str)]
+                    results.append(MarketInfo(
+                        condition_id=cid,
+                        question=question,
+                        end_date=mkt.get("endDateIso") or mkt.get("endDate"),
+                        volume=float(mkt.get("volumeNum") or mkt.get("volume") or 0),
+                        active=not mkt.get("closed", False),
+                        tokens=tokens,
+                        raw=mkt,
+                    ))
+        except Exception as exc:
+            logger.warning("Gamma API unavailable (%s) — falling back to CLOB search", exc)
+            # Fallback: CLOB text search
+            for term in ("Bitcoin", "BTC"):
+                try:
+                    for m in await self.search_markets(term, active_only=True):
+                        if m.condition_id not in seen and any(kw in m.question.lower() for kw in btc_kws):
+                            seen.add(m.condition_id)
+                            results.append(m)
+                except Exception as e2:
+                    logger.warning("CLOB search(%r) failed: %s", term, e2)
+
+        logger.info("fetch_btc_markets: %d live BTC markets found", len(results))
+        return results
 
     async def fetch_btc_5min_markets(self) -> list[MarketInfo]:
-        """Fetch active BTC 5-minute price resolution markets.
+        """Return BTC markets resolving within the next 24 hours.
 
-        Filters the broader BTC market list to those that appear to be
-        5-minute resolution markets (title contains "5" and time-related
-        keywords like "min", "minute", "5m").
+        Long-term markets (Bitcoin reserve bill, $150k by December, etc.) are
+        filtered out — they have no short-term arbitrage opportunity.
+        Only markets with a parseable end_date < now+24h are included.
 
         Returns
         -------
-        list of MarketInfo for BTC 5-minute markets.
+        list of MarketInfo for short-horizon BTC markets.
         """
+        from datetime import datetime, timezone, timedelta
+
         all_btc = await self.fetch_btc_markets()
-        keywords = ("5 min", "5min", "5-min", "5m ", "5 m", "five min", "5 minute")
-        result = [
-            m for m in all_btc
-            if any(kw in m.question.lower() for kw in keywords)
-        ]
-        return result
+        now = datetime.now(timezone.utc)
+        cutoff = now + timedelta(hours=24)
+
+        short_horizon: list[MarketInfo] = []
+        for m in all_btc:
+            if not m.end_date:
+                logger.debug("Skipping %r — no end_date", m.question[:50])
+                continue
+            try:
+                # Handle ISO strings with or without timezone suffix
+                raw = m.end_date.rstrip("Z")
+                if "+" in raw:
+                    raw = raw.split("+")[0]
+                end_dt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                logger.debug("Skipping %r — unparseable end_date %r", m.question[:50], m.end_date)
+                continue
+
+            if end_dt > cutoff:
+                logger.debug(
+                    "Skipping %r — resolves too far out (%s)",
+                    m.question[:50], end_dt.strftime("%Y-%m-%d"),
+                )
+                continue
+
+            logger.info("SHORT-HORIZON market: %r ends %s", m.question[:60], end_dt.isoformat())
+            short_horizon.append(m)
+
+        if short_horizon:
+            logger.info(
+                "fetch_btc_5min_markets: %d/%d markets resolve within 24h",
+                len(short_horizon), len(all_btc),
+            )
+            return short_horizon
+
+        # Fallback: no markets resolve within 24h — return nearest-expiry markets
+        parseable = []
+        for m in all_btc:
+            if not m.end_date:
+                continue
+            try:
+                raw = m.end_date.rstrip("Z").split("+")[0]
+                end_dt = datetime.fromisoformat(raw).replace(tzinfo=timezone.utc)
+                if end_dt > now:
+                    parseable.append((end_dt, m))
+            except (ValueError, AttributeError):
+                continue
+
+        if parseable:
+            parseable.sort(key=lambda x: x[0])
+            nearest = [m for _, m in parseable[:5]]
+            logger.info(
+                "fetch_btc_5min_markets: no 24h markets — returning %d nearest-expiry",
+                len(nearest),
+            )
+            for _, m in parseable[:5]:
+                logger.info("  nearest: %r end=%s", m.question[:60], _.isoformat())
+            return nearest
+
+        logger.warning("fetch_btc_5min_markets: no markets with parseable end_date")
+        return all_btc[:5]
+
+    async def fetch_short_horizon_markets(self) -> list[MarketInfo]:
+        """Fetch 5-minute and 15-minute crypto Up/Down windows (soonest first).
+
+        Target market format:
+          "Bitcoin Up or Down - March 16, 7:20PM-7:25PM ET"  (5-min)
+          "Bitcoin Up or Down - March 16, 7:30PM-7:45PM ET"  (15-min)
+
+        Excluded:
+          - Hourly: "Bitcoin Up or Down - March 16, 4PM ET"  (no colon in time)
+          - Daily:  "Bitcoin Up or Down on March 17?"
+
+        Strategy:
+          1. Pull all crypto events from Gamma API sorted by endDate ASC.
+          2. Filter title: "up or down" + time-range pattern HH:MMxM-HH:MMxM.
+          3. Skip already-resolved (endDate <= now).
+          4. Return top 10 soonest-expiring.
+
+        Returns
+        -------
+        list of MarketInfo sorted by endDate ascending (soonest first), max 10.
+        """
+        import json as _json
+        import re
+        from datetime import datetime, timezone
+
+        # Matches "7:30PM-7:45PM" or "11:00PM-11:15PM" — time range with colon
+        _WINDOW_RE = re.compile(r"\d+:\d+[AP]M-\d+:\d+[AP]M", re.IGNORECASE)
+
+        now = datetime.now(timezone.utc)
+
+        def _parse_end(raw_end: str | None) -> datetime | None:
+            if not raw_end:
+                return None
+            try:
+                s = raw_end.rstrip("Z").split("+")[0]
+                return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+            except (ValueError, AttributeError):
+                return None
+
+        def _extract_tokens(mkt: dict) -> list[dict]:
+            raw = mkt.get("clobTokenIds") or mkt.get("tokens") or []
+            if isinstance(raw, str):
+                try:
+                    raw = _json.loads(raw)
+                except Exception:
+                    raw = []
+            return [{"token_id": tid} for tid in raw if isinstance(tid, str)]
+
+        results: list[tuple[datetime, MarketInfo]] = []  # (end_dt, market)
+        seen: set[str] = set()
+
+        try:
+            data = await self._gamma_get(
+                "/events",
+                params={
+                    "closed": "false",
+                    "limit": 200,
+                    "tag_slug": "crypto",
+                    "order": "liquidity",
+                    "ascending": "false",
+                },
+            )
+            events = data if isinstance(data, list) else data.get("data", [])
+
+            for event in events:
+                ev_title = event.get("title") or event.get("name") or ""
+                if "up or down" not in ev_title.lower():
+                    continue
+                # Must have a time-range pattern (excludes hourly and daily)
+                if not _WINDOW_RE.search(ev_title):
+                    continue
+
+                for mkt in event.get("markets", []):
+                    if mkt.get("closed", False):
+                        continue
+                    if not mkt.get("acceptingOrders", False):
+                        continue
+
+                    cid = mkt.get("conditionId") or mkt.get("condition_id") or ""
+                    if not cid or cid in seen:
+                        continue
+
+                    tokens = _extract_tokens(mkt)
+                    if not tokens:
+                        continue
+
+                    raw_end = mkt.get("endDate") or mkt.get("endDateIso") or None
+                    end_dt = _parse_end(raw_end)
+                    if end_dt is None or end_dt <= now:
+                        continue  # skip resolved or undated
+
+                    seen.add(cid)
+                    question = mkt.get("question") or ev_title or ""
+                    liq = float(mkt.get("liquidityNum") or mkt.get("liquidity") or
+                                event.get("liquidity") or 0)
+
+                    results.append((end_dt, MarketInfo(
+                        condition_id=cid,
+                        question=question,
+                        end_date=raw_end,
+                        volume=liq,
+                        active=True,
+                        tokens=tokens,
+                        raw=mkt,
+                    )))
+
+        except Exception as exc:
+            logger.warning("fetch_short_horizon_markets Gamma API failed (%s)", exc)
+            return []
+
+        # Prefer markets expiring within 20 minutes; fall back to 45 minutes
+        short = [(dt, m) for dt, m in results if (dt - now).total_seconds() <= 1200]
+        if short:
+            results = short
+        else:
+            results = [(dt, m) for dt, m in results if (dt - now).total_seconds() <= 2700]
+
+        # Sort soonest-expiring first, cap at 10
+        results.sort(key=lambda x: x[0])
+        top10 = [m for _, m in results[:10]]
+
+        if not top10:
+            logger.warning(
+                "fetch_short_horizon_markets: no 5/15-min Up/Down windows found"
+            )
+            return []
+
+        logger.info(
+            "fetch_short_horizon_markets: %d 5/15-min windows (soonest first)",
+            len(top10),
+        )
+        for i, m in enumerate(top10, 1):
+            end_dt = _parse_end(m.end_date)
+            mins_left = int((end_dt - now).total_seconds() / 60) if end_dt else -1
+            logger.info(
+                "  #%2d %3dmin  tokens=%d  %s",
+                i, mins_left, len(m.tokens), m.question[:65],
+            )
+
+        return top10
 
     async def fetch_mid_prices(self, token_ids: list[str]) -> dict[str, float]:
         """Fetch mid-point prices for a batch of tokens.
