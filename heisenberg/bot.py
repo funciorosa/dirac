@@ -20,11 +20,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from polymarket_client import PolymarketCLOBClient, OrderBook, MarketInfo
+
+# ---------------------------------------------------------------------------
+# Cycle callback — set by api_server.py to receive live updates
+# ---------------------------------------------------------------------------
+on_cycle_complete: Optional[Callable] = None
 from bayesian_model import BayesianModel, MarketFeatures, compute_ewma_vol
 from edge_filter import EdgeFilter, SpreadData, EdgeSignal
 from kelly_sizing import KellySizer, KellyInput
@@ -45,13 +51,18 @@ logger = logging.getLogger("HEISENBERG")
 # Pipeline config
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL_SECONDS = 5        # How often to scan markets
-MAX_MARKETS_PER_CYCLE = 10       # Cap to avoid rate limits
-BANKROLL = 1_000.0               # Simulated capital (no real money)
-KELLY_FRACTION = 0.25            # Fractional Kelly multiplier
-MIN_EDGE_BPS = 50                # Minimum net edge to consider a signal
-MIN_Z_SCORE = 1.5                # Minimum z-score threshold
-MAX_SPREAD_BPS = 500             # Maximum acceptable spread
+POLL_INTERVAL_SECONDS = 2        # Aggressive: scan every 2 seconds
+MAX_MARKETS_PER_CYCLE = 0        # 0 = no cap, scan everything
+BANKROLL = float(os.getenv("STARTING_CAPITAL", "100"))
+KELLY_FRACTION = 0.20            # Conservative fractional Kelly
+MIN_EDGE_BPS = 10                # Low threshold — z-score is the gate
+MIN_Z_SCORE = 1.5                # Require meaningful z-score before trading
+MAX_SPREAD_BPS = 800             # Relaxed spread tolerance
+
+# Market health filters — applied per token after book fetch
+MID_PRICE_MIN = 0.05             # Skip near-resolved NO (< 5%)
+MID_PRICE_MAX = 0.95             # Skip near-resolved YES (> 95%)
+MAX_SPREAD_FILTER = 0.10         # Skip illiquid books (spread > 10%)
 
 
 @dataclass
@@ -67,6 +78,7 @@ class PipelineSignal:
     reservation_price: float
     bid_quote: float
     ask_quote: float
+    end_date: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
     def summary(self) -> str:
@@ -109,7 +121,7 @@ class HeisenbergBot:
             min_z_score=MIN_Z_SCORE,
             max_spread_bps=MAX_SPREAD_BPS,
         )
-        self.kelly = KellySizer(kelly_fraction=KELLY_FRACTION, max_position_pct=0.05)
+        self.kelly = KellySizer(kelly_fraction=KELLY_FRACTION, max_position_pct=0.10)
         self.stoikov = StoikovQuoter(StoikovParams(gamma=0.1, sigma=0.02, T=300.0))
 
         # Rolling price history per token for z-score computation
@@ -120,7 +132,7 @@ class HeisenbergBot:
     # ------------------------------------------------------------------
 
     async def _process_token(
-        self, token_id: str, question: str, elapsed_t: float
+        self, token_id: str, question: str, elapsed_t: float, end_date: Optional[str] = None
     ) -> Optional[PipelineSignal]:
         """Run full pipeline for one token. Returns None on data failure."""
         # 1. Fetch live orderbook
@@ -137,6 +149,21 @@ class HeisenbergBot:
         mid = book.mid_price
         bid = book.best_bid
         ask = book.best_ask
+        spread = ask - bid
+
+        # Filter near-resolved markets and illiquid books
+        if mid < MID_PRICE_MIN or mid > MID_PRICE_MAX:
+            logger.debug(
+                "Skipping near-resolved token %s mid=%.3f (out of [%.2f, %.2f])",
+                token_id[:12], mid, MID_PRICE_MIN, MID_PRICE_MAX,
+            )
+            return None
+        if spread > MAX_SPREAD_FILTER:
+            logger.debug(
+                "Skipping illiquid token %s spread=%.3f > %.2f",
+                token_id[:12], spread, MAX_SPREAD_FILTER,
+            )
+            return None
 
         # 2. Update rolling price history
         history = self._price_history.setdefault(token_id, [])
@@ -170,7 +197,13 @@ class HeisenbergBot:
         spread_data = self.edge_filter.compute_spread(bid, ask)
 
         # 6. Z-score + EV + net edge
-        z_score = self.edge_filter.compute_z_score(mid, history[:-1], window=60)
+        z_score = self.edge_filter.compute_z_score(mid, history[:-1], window=20)
+        logger.debug(
+            "token=%s mid=%.3f z=%.3f ev=%.4f hist_len=%d",
+            token_id[:12], mid, z_score,
+            0.0,  # ev computed below
+            len(history),
+        )
         ev = self.edge_filter.compute_ev(
             prob=posterior,
             odds_yes=1.0 / ask if ask > 0 else 0.0,
@@ -178,16 +211,28 @@ class HeisenbergBot:
             fee_bps=20,
         )
         edge_signal = self.edge_filter.filter(spread_data, z_score, ev, posterior)
+        logger.info(
+            "  %-12s mid=%.3f spread=%.3f z=%+.3f ev=%+.4f net=%+.4f %s",
+            token_id[:12], mid, spread, z_score, ev,
+            edge_signal.net_edge,
+            "SIGNAL" if edge_signal.is_tradeable else "skip",
+        )
 
         # 7. Kelly position sizing
+        odds_win = 1.0 / ask if ask > 0 else 1.0
         kelly_input = KellyInput(
             prob_win=posterior,
-            odds_win=1.0 / ask if ask > 0 else 1.0,
+            odds_win=odds_win,
             odds_lose=1.0 / (1.0 - bid) if bid < 1.0 else 1.0,
             bankroll=self.bankroll,
             kelly_fraction=KELLY_FRACTION,
         )
         kelly_result = self.kelly.compute_kelly(kelly_input)
+        logger.debug(
+            "KELLY DEBUG: prob=%.3f odds_win=%.3f b=%.3f full_kelly=%.4f frac_kelly=%.4f size=$%.2f",
+            posterior, odds_win, odds_win - 1,
+            kelly_result.full_kelly, kelly_result.fractional_kelly, kelly_result.position_size,
+        )
 
         # 8. Stoikov reservation price + optimal quotes
         inventory = 0.0  # neutral inventory (no positions held yet)
@@ -203,6 +248,7 @@ class HeisenbergBot:
             reservation_price=quotes.reservation_price,
             bid_quote=quotes.bid_quote,
             ask_quote=quotes.ask_quote,
+            end_date=end_date,
         )
 
     # ------------------------------------------------------------------
@@ -210,10 +256,12 @@ class HeisenbergBot:
     # ------------------------------------------------------------------
 
     async def _fetch_active_btc_markets(self) -> list[MarketInfo]:
-        """Fetch BTC 5-min markets from Polymarket."""
+        """Fetch short-horizon crypto markets from Polymarket, sorted by volume."""
         try:
-            markets = await self.client.fetch_btc_5min_markets()
-            return markets[:MAX_MARKETS_PER_CYCLE]
+            markets = await self.client.fetch_short_horizon_markets()
+            if MAX_MARKETS_PER_CYCLE > 0:
+                return markets[:MAX_MARKETS_PER_CYCLE]
+            return markets
         except Exception as exc:
             logger.warning("Market discovery failed: %s", exc)
             return []
@@ -238,7 +286,7 @@ class HeisenbergBot:
             for token in market.tokens:
                 token_id = token.get("token_id", "") if isinstance(token, dict) else str(token)
                 if token_id:
-                    tasks.append(self._process_token(token_id, market.question, elapsed_t))
+                    tasks.append(self._process_token(token_id, market.question, elapsed_t, market.end_date))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -250,11 +298,34 @@ class HeisenbergBot:
             elif isinstance(r, Exception):
                 logger.debug("Token processing error: %s", r)
 
+        # Deduplicate: for each market event keep only the one token with the
+        # highest absolute net_edge.  Two tokens share the same market_question
+        # (YES and NO sides of the same Up/Down window), so trading both would
+        # mean taking both sides — guaranteed to cancel out PnL.
+        best: dict[str, PipelineSignal] = {}
+        for s in signals:
+            key = s.market_question  # same for both YES/NO tokens
+            if key not in best or abs(s.edge_signal.net_edge) > abs(best[key].edge_signal.net_edge):
+                best[key] = s
+        if len(signals) != len(best):
+            logger.info(
+                "Dedup: %d tokens → %d (dropped %d same-market duplicates)",
+                len(signals), len(best), len(signals) - len(best),
+            )
+        signals = list(best.values())
+
         tradeable = [s for s in signals if s.edge_signal.is_tradeable]
         logger.info(
             "Cycle %d complete — %d tokens scanned, %d tradeable signals",
             cycle_num, len(signals), len(tradeable),
         )
+
+        if on_cycle_complete is not None:
+            try:
+                await on_cycle_complete(signals)
+            except Exception as cb_exc:
+                logger.debug("on_cycle_complete error: %s", cb_exc)
+
         return signals
 
     # ------------------------------------------------------------------
