@@ -62,6 +62,7 @@ app.add_middleware(
 
 _STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL", "100"))
 _LIVE_MODE = os.getenv("PAPER_TRADING", "true").lower() == "false"
+logger.warning("DIRAC MODE: %s", "LIVE TRADING" if _LIVE_MODE else "PAPER TRADING")
 bot_instance = HeisenbergBot(bankroll=_STARTING_CAPITAL)
 
 # ---------------------------------------------------------------------------
