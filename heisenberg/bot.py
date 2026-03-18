@@ -56,7 +56,7 @@ MAX_MARKETS_PER_CYCLE = 0        # 0 = no cap, scan everything
 BANKROLL = float(os.getenv("STARTING_CAPITAL", "100"))
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.20"))  # Conservative fractional Kelly
 MIN_EDGE_BPS = 10                # Low threshold — z-score is the gate
-MIN_Z_SCORE = 1.5                # Require meaningful z-score before trading
+MIN_Z_SCORE = float(os.getenv("MIN_Z_SCORE", "0.3"))  # 5-min markets rarely exceed 1.5
 MAX_SPREAD_BPS = 800             # Relaxed spread tolerance
 
 # Market health filters — applied per token after book fetch
