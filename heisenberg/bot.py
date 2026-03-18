@@ -337,7 +337,7 @@ class HeisenbergBot:
         Main event loop. Runs indefinitely (max_cycles=0) or for N cycles.
         READ-ONLY: logs signals only, no orders placed.
         """
-        logger.info("HEISENBERG bot starting — READ-ONLY MODE, no live trading.")
+        logger.info("DIRAC bot starting — LIVE TRADING MODE")
         logger.info("Bankroll: $%.2f | Kelly: %.0f%% | Poll: %ds",
                     self.bankroll, KELLY_FRACTION * 100, POLL_INTERVAL_SECONDS)
 
