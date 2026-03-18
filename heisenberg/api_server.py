@@ -34,7 +34,7 @@ from bot import HeisenbergBot, PipelineSignal
 import order_executor as _oe
 
 load_dotenv()
-logger = logging.getLogger("api_server")
+logger = logging.getLogger("HEISENBERG")
 
 # ---------------------------------------------------------------------------
 # Capital fence (DIRAC)

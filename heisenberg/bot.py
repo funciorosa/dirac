@@ -324,7 +324,7 @@ class HeisenbergBot:
             try:
                 await on_cycle_complete(signals)
             except Exception as cb_exc:
-                logger.debug("on_cycle_complete error: %s", cb_exc)
+                logger.error("on_cycle_complete ERROR: %s", cb_exc, exc_info=True)
 
         return signals
 
