@@ -321,10 +321,13 @@ class HeisenbergBot:
         )
 
         if on_cycle_complete is not None:
+            logger.info("DIRAC: calling on_cycle_complete (tradeable=%d)", len(tradeable))
             try:
                 await on_cycle_complete(signals)
             except Exception as cb_exc:
                 logger.error("on_cycle_complete ERROR: %s", cb_exc, exc_info=True)
+        else:
+            logger.warning("DIRAC: on_cycle_complete is None — api_server not connected")
 
         return signals
 
