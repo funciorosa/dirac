@@ -54,7 +54,7 @@ logger = logging.getLogger("HEISENBERG")
 POLL_INTERVAL_SECONDS = 2        # Aggressive: scan every 2 seconds
 MAX_MARKETS_PER_CYCLE = 0        # 0 = no cap, scan everything
 BANKROLL = float(os.getenv("STARTING_CAPITAL", "100"))
-KELLY_FRACTION = 0.20            # Conservative fractional Kelly
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.20"))  # Conservative fractional Kelly
 MIN_EDGE_BPS = 10                # Low threshold — z-score is the gate
 MIN_Z_SCORE = 1.5                # Require meaningful z-score before trading
 MAX_SPREAD_BPS = 800             # Relaxed spread tolerance
